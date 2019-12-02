@@ -1,17 +1,13 @@
 #!/usr/bin/env python
 
-"""INTRODUCTION TO ACTIVE LEARNING
-
-A simple text classification algorithm in PyTorch 
-
-This is an open source example to accompany Chapter 2 from the book:
+"""ACTIVE LEARNING
+ 
+This is an open source example to accompany Chapters 3 and 4 from the book:
 "Human-in-the-Loop Machine Learning"
 
 This example tries to classify news headlines into one of two categories:
   disaster-related
   not disaster-related
-
-It looks for low confidence items and outliers humans should review
 
 """
 
@@ -25,20 +21,30 @@ import datetime
 import csv
 import re
 import os
+import getopt, sys
+
 from random import shuffle
 from collections import defaultdict	
+# from numpy import rank
+
+from diversity_sampling import DiversitySampling
+from uncertainty_sampling import UncertaintySampling
+from advanced_active_learning import AdvancedActiveLearning
+from pytorch_clusters import CosineClusters 
+from pytorch_clusters import Cluster
 
 
 __author__ = "Robert Munro"
 __license__ = "MIT"
 __version__ = "1.0.1"
 
+   
 # settings
-
 minimum_evaluation_items = 1200 # annotate this many randomly sampled items first for evaluation data before creating training data
-minimum_training_items = 400 # minimum number of training items before we first train a model
+minimum_validation_items = 200 # annotate this many randomly sampled items first for validation data before creating training data
+minimum_training_items = 100 # minimum number of training items before we first train a model
 
-epochs = 10 # number of epochs per training session
+epochs = 20 # default number of epochs per training session
 select_per_epoch = 200  # number to select per epoch per label
 
 
@@ -51,11 +57,98 @@ unlabeled_data = "unlabeled_data/unlabeled_data.csv"
 evaluation_related_data = "evaluation_data/related.csv"
 evaluation_not_related_data = "evaluation_data/not_related.csv"
 
-#validation_related_data # not used in this example
-#validation_not_related_data # not used in this example
+validation_related_data  = "validation_data/related.csv" 
+validation_not_related_data = "validation_data/not_related.csv" 
 
 training_related_data = "training_data/related.csv"
 training_not_related_data = "training_data/not_related.csv"
+
+# default number to sample for each method
+number_random = 5
+
+number_least_confidence = 0
+number_margin_confidence = 0
+number_ratio_confidence = 0
+number_entropy_based = 0
+
+number_model_outliers = 0
+number_cluster_based = 0
+number_representative = 0
+number_adaptive_representative = 0
+
+number_representative_clusters = 0
+number_clustered_uncertainty = 0
+number_uncertain_model_outliers = 0
+number_high_uncertainty_cluster = 0
+number_transfer_learned_uncertainty = 0
+number_atlas = 0
+
+verbose = False
+
+cli_args = sys.argv
+arg_list = cli_args[1:]
+
+# default option, random:
+gnu_options = ["random_remaining="]
+# uncertainty sampling
+gnu_options += ["least_confidence=", "margin_confidence=", "ratio_confidence=","entropy_based="]
+# diversity sampling
+gnu_options += ["model_outliers=", "cluster_based=","representative=","adaptive_representative="]
+# advanced active learning
+gnu_options += ["representative_clusters=", "clustered_uncertainty=", "uncertain_model_outliers="]
+gnu_options += ["high_uncertainty_cluster=", "transfer_learned_uncertainty="]
+gnu_options += ["atlas="]
+# options
+gnu_options += ["help", "verbose"]
+
+try:
+    arguments, values = getopt.getopt(arg_list, "", gnu_options)
+except getopt.error as err:
+    # output error, and return with an error code
+    print (str(err))
+    sys.exit(2)
+
+for arg, value in arguments:
+    if arg == "--random_remaining":
+        number_random = int(value)
+    if arg == "--model_outliers":
+        number_model_outliers = int(value)
+    if arg == "--cluster_based":
+        number_cluster_based = int(value)
+    if arg == "--representative":
+        number_representative = int(value)
+    if arg == "--adaptive_representative":
+        number_adaptive_representative = int(value)
+    if arg == "--least_confidence":
+        number_least_confidence = int(value)
+    if arg == "--margin_confidence":
+        number_margin_confidence = int(value)
+    if arg == "--ratio_confidence":
+        number_ratio_confidence = int(value)
+    if arg == "--entropy_based":
+        number_entropy_based = int(value)
+    if arg == "--representative_clusters":
+        number_representative_clusters = int(value)
+    if arg == "--clustered_uncertainty":
+        number_clustered_uncertainty = int(value)
+    if arg == "--uncertain_model_outliers":
+        number_uncertain_model_outliers = int(value)
+    if arg == "--high_uncertainty_cluster":
+        number_high_uncertainty_cluster = int(value)
+    if arg == "--transfer_learned_uncertainty":
+        number_transfer_learned_uncertainty = int(value)
+    if arg == "--atlas":
+        number_atlas = int(value)
+    if arg == "--verbose":
+        verbose = True
+    if arg == "--help":
+        print("\nValid options for Active Learning sampling: ")
+        for option in gnu_options:
+            print("\t"+option)
+        print("\nFor example `model_outliers=100` will sample 100 unlabeled items through model-based outlier sampling.\n")
+
+        exit()
+    
 
 
 already_labeled = {} # tracking what is already labeled
@@ -103,6 +196,9 @@ def write_data(filepath, data):
 # LOAD ALL UNLABELED, TRAINING, VALIDATION, AND EVALUATION DATA
 training_data = load_data(training_related_data) + load_data(training_not_related_data)
 training_count = len(training_data)
+
+validation_data = load_data(validation_related_data) + load_data(validation_not_related_data)
+validation_count = len(validation_data)
     
 evaluation_data = load_data(evaluation_related_data) + load_data(evaluation_not_related_data)
 evaluation_count = len(evaluation_data)
@@ -147,12 +243,20 @@ def get_annotations(data, default_sampling_strategy="random"):
             text = data[ind][1]
             label = data[ind][2]
             strategy =  data[ind][3]
+            score = data[ind][4]
+            
+            if strategy == "":
+                strategy = "random"
 
             if textid in already_labeled:
-                print("Skipping seen "+label)
+                if verbose:
+                    print("Skipping seen "+str(textid)+" with label "+label)
+                    print(data[ind])
                 ind+=1
             else:
                 print(annotation_instructions)
+                if verbose:
+                    print("Sampled with strategy `"+str(strategy)+"` and score "+str(round(score,3)))
                 label = str(input(text+"\n\n> ")) 
 
                 if label == "2":                   
@@ -218,15 +322,21 @@ class SimpleTextClassifier(nn.Module):  # inherit pytorch's nn.Module
         self.linear1 = nn.Linear(vocab_size, 128)
         self.linear2 = nn.Linear(128, num_labels)
 
-    def forward(self, feature_vec):
-        # Define how data is passed through the model
+    def forward(self, feature_vec, return_all_layers=False):
+        # Define how data is passed through the model and what gets returned
 
         hidden1 = self.linear1(feature_vec).clamp(min=0) # ReLU
         output = self.linear2(hidden1)
-        return F.log_softmax(output, dim=1)
+        log_softmax = F.log_softmax(output, dim=1)
+
+        if return_all_layers:
+            return [hidden1, output, log_softmax]
+        else:
+            return log_softmax
                                 
 
-def make_feature_vector(features, feature_index):
+def make_feature_vector(text):
+    features = text.split()
     vec = torch.zeros(len(feature_index))
     for feature in features:
         if feature in feature_index:
@@ -252,7 +362,8 @@ def train_model(training_data, validation_data = "", evaluation_data = "", num_l
 
     # epochs training
     for epoch in range(epochs):
-        print("Epoch: "+str(epoch))
+        if verbose:
+            print("Epoch: "+str(epoch))
         current = 0
 
         # make a subset of data to use in this epoch
@@ -268,12 +379,12 @@ def train_model(training_data, validation_data = "", evaluation_data = "", num_l
                 
         # train our model
         for item in epoch_data:
-            features = item[1].split()
+            text = item[1]
             label = int(item[2])
 
             model.zero_grad() 
 
-            feature_vec = make_feature_vector(features, feature_index)
+            feature_vec = make_feature_vector(text)
             target = torch.LongTensor([int(label)])
 
             log_probs = model(feature_vec)
@@ -298,41 +409,6 @@ def train_model(training_data, validation_data = "", evaluation_data = "", num_l
     return model_path
 
 
-def get_low_conf_unlabeled(model, unlabeled_data, number=80, limit=10000):
-    confidences = []
-    if limit == -1: # we're predicting confidence on *everything* this will take a while
-    	print("Get confidences for unlabeled data (this might take a while)")
-    else: 
-    	# only apply the model to a limited number of items
-    	shuffle(unlabeled_data)
-    	unlabeled_data = unlabeled_data[:limit]
-    
-    with torch.no_grad():
-        for item in unlabeled_data:
-            textid = item[0]
-            if textid in already_labeled:
-                continue
-
-            text = item[1]
-
-            feature_vector = make_feature_vector(text.split(), feature_index)
-            log_probs = model(feature_vector)
-
-            # get confidence that it is related
-            prob_related = math.exp(log_probs.data.tolist()[0][1]) 
-            
-            if prob_related < 0.5:
-                confidence = 1 - prob_related
-            else:
-                confidence = prob_related 
-
-            item[3] = "low confidence"
-            item[4] = confidence
-            confidences.append(item)
-
-    confidences.sort(key=lambda x: x[4])
-    return confidences[:number:]
-
 
 def get_random_items(unlabeled_data, number = 10):
     shuffle(unlabeled_data)
@@ -349,59 +425,7 @@ def get_random_items(unlabeled_data, number = 10):
 
     return random_items
 
-
-def get_outliers(training_data, unlabeled_data, number=10):
-    """Get outliers from unlabeled data in training data
-
-    Returns number outliers
-    
-    An outlier is defined as the percent of words in an item in 
-    unlabeled_data that do not exist in training_data
-    """
-    outliers = []
-
-    total_feature_counts = defaultdict(lambda: 0)
-    
-    for item in training_data:
-        text = item[1]
-        features = text.split()
-
-        for feature in features:
-            total_feature_counts[feature] += 1
-                
-    while(len(outliers) < number):
-        top_outlier = []
-        top_match = float("inf")
-
-        for item in unlabeled_data:
-            textid = item[0]
-            if textid in already_labeled:
-                continue
-
-            text = item[1]
-            features = text.split()
-            total_matches = 1 # start at 1 for slight smoothing 
-            for feature in features:
-                if feature in total_feature_counts:
-                    total_matches += total_feature_counts[feature]
-
-            ave_matches = total_matches / len(features)
-            if ave_matches < top_match:
-                top_match = ave_matches
-                top_outlier = item
-
-        # add this outlier to list and update what is 'labeled', 
-        # assuming this new outlier will get a label
-        top_outlier[3] = "outlier"
-        outliers.append(top_outlier)
-        text = top_outlier[1]
-        features = text.split()
-        for feature in features:
-            total_feature_counts[feature] += 1
-
-    return outliers
-    
-
+        
 
 def evaluate_model(model, evaluation_data):
     """Evaluate the model on the held-out evaluation data
@@ -420,7 +444,7 @@ def evaluate_model(model, evaluation_data):
         for item in evaluation_data:
             _, text, label, _, _, = item
 
-            feature_vector = make_feature_vector(text.split(), feature_index)
+            feature_vector = make_feature_vector(text)
             log_probs = model(feature_vector)
 
             # get confidence that item is disaster-related
@@ -490,6 +514,33 @@ if evaluation_count <  minimum_evaluation_items:
     append_data(evaluation_related_data, related)
     append_data(evaluation_not_related_data, not_related)
 
+if validation_count <  minimum_validation_items:
+    #Keep adding to evaluation data first
+    print("Creating validation data:\n")
+
+    shuffle(data)
+    needed = minimum_validation_items - validation_count
+    data = data[:needed]
+    print(str(needed)+" more annotations needed")
+
+    data = get_annotations(data) 
+    
+    related = []
+    not_related = []
+
+    for item in data:
+        label = item[2]    
+        if label == "1":
+            related.append(item)
+        elif label == "0":
+            not_related.append(item)
+
+    # append validation data
+    append_data(validation_related_data, related)
+    append_data(validation_not_related_data, not_related)
+
+
+
 elif training_count < minimum_training_items:
     # lets create our first training data! 
     print("Creating initial training data:\n")
@@ -516,25 +567,166 @@ elif training_count < minimum_training_items:
     append_data(training_not_related_data, not_related)
 else:
     # lets start Active Learning!! 
+    sampled_data = []
 
-	# Train new model with current training data
-    vocab_size = create_features()
-    model_path = train_model(training_data, evaluation_data=evaluation_data, vocab_size=vocab_size)
+        
+    # GET RANDOM SAMPLES
+    if number_random > 0:
+        print("Sampling "+str(number_random)+" Random Remaining Items\n")
+        sampled_data += get_random_items(data, number=number_random)
 
-    print("Sampling via Active Learning:\n")
 
-    model = SimpleTextClassifier(2, vocab_size)
-    model.load_state_dict(torch.load(model_path))
+    # RETRAIN WHOLE MODEL IF WE NEED IT FOR ANY METHOD:
+    if (number_least_confidence + number_margin_confidence + number_ratio_confidence +                                 
+                number_entropy_based + number_clustered_uncertainty + number_uncertain_model_outliers +
+                number_high_uncertainty_cluster > 0):
+        print("Retraining model for Uncertainty Sampling \n")    
 
-	# get 100 items per iteration with the following breakdown of strategies:
-    random_items = get_random_items(data, number=10)
-    low_confidences = get_low_conf_unlabeled(model, data, number=80)
-    outliers = get_outliers(training_data+random_items+low_confidences, data, number=10)
+        vocab_size = create_features()
+        model_path = train_model(training_data, evaluation_data=evaluation_data, vocab_size=vocab_size)
+        model = SimpleTextClassifier(2, vocab_size)
+        model.load_state_dict(torch.load(model_path)) 
 
-    sampled_data = random_items + low_confidences + outliers
+    # RETRAIN MODEL WITH TRAIN/VALIDATION SPLIT IF WE NEED IT FOR ANY METHOD:
+    if number_model_outliers + number_uncertain_model_outliers + number_transfer_learned_uncertainty + number_atlas > 0:
+        print("Retraining model for Model-based Outliers or Deep Active Transfer Learning \n")    
+
+        # Need to split our training data to make a leave-out validation set:            
+        new_training_data = training_data[:int(len(training_data)*0.9)] 
+        new_validation_data = training_data[len(new_training_data):] 
+
+        vocab_size = create_features()
+        model_path = train_model(new_training_data, evaluation_data=evaluation_data, vocab_size=vocab_size)
+        validation_model = SimpleTextClassifier(2, vocab_size)
+        validation_model.load_state_dict(torch.load(model_path))
+
+
+    uncert_sampling = UncertaintySampling(verbose)    
+    diversity_samp = DiversitySampling(verbose)      
+    adv_samping = AdvancedActiveLearning(verbose)   
+
+
+    if number_cluster_based + number_representative + number_adaptive_representative + number_model_outliers > 0:
+        print("Sampling for Diversity")
+        
+        # GET MODEL-BASED OUTLIER SAMPLES
+        if number_model_outliers > 0:
+            print("Sampling "+str(number_model_outliers)+" Model Outliers\n")
+        
+            sampled_data += diversity_samp.get_model_outliers(validation_model, data, new_validation_data, 
+                                                              make_feature_vector, number=number_model_outliers)
+
+
+        # GET CLUSTER-BASED SAMPLES
+        if number_cluster_based > 0:
+            print("Sampling "+str(number_cluster_based)+" via Clustering")
+            num_clusters = math.ceil(number_cluster_based / 5) # sampling 5 items per cluster by default
+            print("Creating "+str(num_clusters)+" Clusters")
+    
+            if num_clusters * 5 > number_cluster_based:
+                print("Adjusting sample to "+str(num_clusters * 5)+" to get an equal number per sample\n")
+            
+            sampled_data += diversity_samp.get_cluster_samples(data, num_clusters=num_clusters)
+        
+    
+        # GET REPRESENTATIVE SAMPLES
+        if number_representative > 0:   
+            print("Sampling "+str(number_representative)+" via Representative Sampling\n")
+            sampled_data += diversity_samp.get_representative_samples(training_data, data, number=number_representative)
+    
+    
+        # GET REPRESENTATIVE SAMPLES USING ADAPTIVE SAMPLING
+        if number_adaptive_representative > 0:
+            print("Sampling "+str(number_adaptive_representative)+" via Adaptive Representative Sampling\n")    
+            sampled_data += diversity_samp.get_adaptive_representative_samples(training_data, data, 
+                                                                               number=number_adaptive_representative)
+  
+        
+    if number_least_confidence + number_margin_confidence + number_ratio_confidence + number_entropy_based > 0:   
+  
+        # GET LEAST CONFIDENCE SAMPLES
+        if number_least_confidence > 0:
+            print("Sampling "+str(number_least_confidence)+" via Least Confidence Sampling\n")    
+    
+            sampled_data += uncert_sampling.get_samples(model, data, uncert_sampling.least_confidence, 
+                                                        make_feature_vector, number=number_least_confidence)
+
+        # GET MARGIN OF CONFIDENCE SAMPLES
+        if number_margin_confidence > 0:
+            print("Sampling "+str(number_margin_confidence)+" via Margin of Confidence Sampling\n")    
+    
+            # margin_confidence_samples = get_margin_confidence_samples(model, data, number=number_margin_confidence)
+            sampled_data += uncert_sampling.get_samples(model, data, uncert_sampling.margin_confidence, 
+                                                        make_feature_vector, number=number_margin_confidence)
+
+        # GET LEAST CONFIDENCE SAMPLES
+        if number_ratio_confidence > 0:
+            print("Sampling "+str(number_ratio_confidence)+" via Ratio of Confidence Sampling\n")    
+    
+            # ratio_confidence_samples = get_ratio_confidence_samples(model, data, number=number_ratio_confidence)
+            sampled_data += uncert_sampling.get_samples(model, data, uncert_sampling.ratio_confidence, 
+                                                        make_feature_vector, number=number_ratio_confidence)
+            
+        # GET LEAST CONFIDENCE SAMPLES
+        if number_entropy_based > 0:
+            print("Sampling "+str(number_entropy_based)+" via Entropy-based Sampling\n")    
+    
+            # entropy_based_samples = get_entropy_based_samples(model, data, number=number_entropy_based)
+            sampled_data += uncert_sampling.get_samples(model, data, uncert_sampling.entropy_based, 
+                                                        make_feature_vector, number=number_entropy_based)
+
+
+
+    # ADVANCED TECHNIQUES
+    if number_representative_clusters > 0:
+        print("Sampling "+str(number_representative_clusters)+" via Representative Clusters\n")    
+        
+        sampled_data += adv_samping.get_representative_cluster_samples(training_data, data, 
+                                                            number=number_representative_clusters)
+
+    if number_clustered_uncertainty > 0:
+        print("Sampling "+str(number_clustered_uncertainty)+" via Clustered Least Confidence\n")
+        uncert_sampling = UncertaintySampling(verbose)
+        
+        sampled_data += adv_samping.get_clustered_uncertainty_samples(model, data, 
+                                        uncert_sampling.least_confidence, make_feature_vector, 
+                                        num_clusters=math.ceil(number_clustered_uncertainty/5))
+
+
+
+    if number_uncertain_model_outliers > 0:
+        print("Sampling "+str(number_uncertain_model_outliers)+" via Model-Outlier Least Confidence\n")
+        
+        
+        sampled_data += adv_samping.get_uncertain_model_outlier_samples(model, validation_model, data,  
+                        new_validation_data, uncert_sampling.least_confidence, make_feature_vector, 
+                        number=number_uncertain_model_outliers)
+
+    if number_high_uncertainty_cluster > 0:
+        print("Sampling "+str(number_high_uncertainty_cluster)+" via highest entropy clusters\n")
+        sampled_data += adv_samping.get_high_uncertainty_cluster(model, data, uncert_sampling.entropy_based, 
+                                                make_feature_vector, number=number_high_uncertainty_cluster)
+
+
+    if number_transfer_learned_uncertainty > 0:
+        print("Sampling "+str(number_transfer_learned_uncertainty)+" via deep active transfer learning for uncertainty\n")       
+        sampled_data += adv_samping.get_deep_active_transfer_learning_uncertainty_samples(validation_model, 
+                                                data, new_validation_data, 
+                                                make_feature_vector, number=number_transfer_learned_uncertainty)
+                                                
+    if number_atlas > 0:
+        print("Sampling "+str(number_atlas)+" via adaptive transfer learning for active samplng (ATLAS)\n")       
+        sampled_data += adv_samping.get_atlas_samples(validation_model, 
+                                                data, new_validation_data, 
+                                                make_feature_vector, number=number_atlas)
+                                                
+
+   
+    # GET ANNOTATIONS FROM OUR SAMPLES
     shuffle(sampled_data)
     
     sampled_data = get_annotations(sampled_data)
+    
     related = []
     not_related = []
     for item in sampled_data:
@@ -543,8 +735,8 @@ else:
             related.append(item)
         elif label == "0":
             not_related.append(item)
-
-    # append training data
+        
+    # append training data files
     append_data(training_related_data, related)
     append_data(training_not_related_data, not_related)
     
@@ -569,3 +761,4 @@ if training_count > minimum_training_items:
     print(accuracies)
     print("Model saved to: "+model_path)
     
+
