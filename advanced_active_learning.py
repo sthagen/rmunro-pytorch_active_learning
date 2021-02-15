@@ -235,7 +235,7 @@ class AdvancedActiveLearning():
                 
                 score = method(prob_dist.data[0]) # get the specific type of uncertainty sampling
                 
-                total_uncertainty += 1.0
+                total_uncertainty += score
                 count += 1
                 
             average_uncertainty = total_uncertainty / count
@@ -283,7 +283,6 @@ class AdvancedActiveLearning():
 
             item_hidden_layers[id] = hidden
         
-            prob_dist = torch.exp(log_probs) # the probability distribution of our prediction
             # get confidence that item is disaster-related
             prob_related = math.exp(log_probs.data.tolist()[0][1]) 
 
@@ -326,7 +325,6 @@ class AdvancedActiveLearning():
             # train the final layers model
             for item in epoch_data:                
                 id = item[0]
-                text = item[1]
                 label = 0
                 if id in correct_ids:
                     label = 1
@@ -366,9 +364,7 @@ class AdvancedActiveLearning():
 
                 # use hidden layer from main model as input to model predicting correct/errors
                 logits, log_probs = correct_model(hidden, return_all_layers=True)  
-    
-                prob_dist = torch.exp(log_probs) # the probability distribution of our prediction
-            
+                
                 # get confidence that item is correctly labeled
                 prob_correct = 1 - math.exp(log_probs.data.tolist()[0][1]) 
 
